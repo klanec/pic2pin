@@ -104,7 +104,7 @@ def main():
         print(file, end="\n")
         print(metadata, end="\n\n")
 
-"""
+"""d
  TODO:
     - Create KML file of points (with title as photo file name and date in metadata if available)
     - Add extra info depending on metadata
