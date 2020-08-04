@@ -1,120 +1,237 @@
 #!/usr/bin/env python3
 
-
-"""Reads the EXIF headers from geo-tagged photos. and creates a KML file.
-
-Reads the EXIF headers from geo-tagged photos and creates a KML file mapping each photo as a 
-labelled point on the map
-
-Includes refactored code from the googlearchives:
-https://github.com/googlearchive/js-v2-samples/blob/gh-pages/articles-geotagsimple/exif2kml.py
-with thanks to author mmarks@google.com (Mano Marks)
- 
-  GetFile(): Handles the opening of an individual file.
-  GetHeaders(): Reads the headers from the file.
-  DmsToDecimal(): Converts EXIF GPS headers data to a decimal degree.
-  GetGps(): Parses out the the GPS headers from the headers data.
-  CreateKmlDoc(): Creates an XML document object to represent the KML document.
-  CreatePhotoOverlay: Creates an individual PhotoOverlay XML element object.
-  CreateKmlFile(): Creates and writes out a KML document to file.
-"""
-
-__author__ = "nicholas.ss.harris@gmail.com (Nicholas Harris)"
-
+import os
 import sys
-import xml.dom.minidom
+import argparse
+import hashlib
+import imghdr
 import exifread
+from geopy.geocoders import Nominatim
+from tqdm import tqdm
+
+import json
+import simplekml
 
 
-def dms_to_decimal(deg_num, deg_den, 
-                    min_num, min_den,
-                    sec_num, sec_den):
+SUPPORTED = ['jpeg']
+
+
+class FileReport(object):
+    def __init__(self, digest, paths, geoloc=None):
+        self.digest = digest
+        self.paths = paths
+
+        gps=grab_gps(paths[0])
+        self.latitude=gps.get('latitude', None)
+        self.longitude=gps.get('longitude', None)
+        self.altitude=gps.get('altitude', None)
+        self.address = ""
+        if geoloc is not None and self.latitude is not None:
+            try:
+                self.address = geoloc.reverse("{}, {}".format(self.latitude, self.longitude)).address
+            except TypeError:
+                pass
+    
+    
+    def __str__(self):
+        files = "\t" + "\n\t".join(self.paths)
+        coords = "{}, {}".format(self.latitude, self.longitude)
+        addr = '\nADDRESS:\n\t' + self.address + '\n' if self.address else ''
+        output = "\nFILE: (md5) {d}\n{f}\nCOORDINATES (lat, long):\n\t{ll}{a}\n".format(
+            d=self.digest,
+            f=files,
+            ll=coords,
+            a=addr)
+        return output
+
+
+
+def parse_arguments():
+    parser = argparse.ArgumentParser()
+    supported_formats = ['plain', 'json', 'kml']
+    # Positional
+    parser.add_argument("path", 
+                    help="file or directory to process",
+                    nargs='+')
+    # Formats
+    parser.add_argument('-f', '--format', 
+                    default=['plain'],
+                    choices=supported_formats,
+                    nargs=1,
+                    help="Choose output format")
+    # Optional
+    parser.add_argument("-a", "--address", 
+                    help="Lookup addresses as well (requires network)",
+                    action="store_true")
+    parser.add_argument("-r", "--recursive", 
+                    help="Recurse into subdirectories",
+                    action="store_true")
+    parser.add_argument("-o", "--output", 
+                    help="Write output to file")
+    parser.add_argument("-v", "--verbose", 
+                    help="Prints progress bars (quiet by default)",
+                    action="store_true")
+
+    return vars(parser.parse_args())
+
+
+def md5(fname):
+    '''Take a path to a file and return the MD5 hash of the file as a hex string
+    '''
+    hash_md5 = hashlib.md5()
+    with open(fname, "rb") as f:
+        for chunk in iter(lambda: f.read(4096), b""):
+            hash_md5.update(chunk)
+    return hash_md5.hexdigest()
+
+
+def is_valid_file(file):
+    ''' Takes a path to a file and returns whether it is supported by pic2pin
+    '''
+    return imghdr.what(file) in SUPPORTED
+
+
+def initialize_files(paths, recursive=False):
+    '''Initialize and return the file dictionary in the format {md5(file):[paths]}
+
+    Arguments:
+        path: the FILE or DIRECTORY to initialize
+
+    Keyword arguments:
+        recursive: recurse into subdirectories (default is False)
+    '''
+    hashdict = {}
+    if os.path.isdir(paths[0]) and len(paths) == 1:
+        for root, _, files in os.walk(paths[0]):
+            for f in files:
+                full_path = os.path.join(root, f)
+                if is_valid_file(full_path):
+                    digest = md5(full_path)
+                    if hashdict.get(digest):
+                        hashdict[digest].append(full_path)
+                    else:
+                        hashdict[digest] = [full_path]
+            if not recursive:
+                break
+    else:
+        for path in paths:
+            if is_valid_file(path):
+                digest = md5(path)
+                if hashdict.get(digest):
+                    hashdict[digest].append(path)
+                else:
+                    hashdict[digest] = [path]
+    return hashdict
 
     
-    degree = deg_num / deg_den
-    minute = min_num / min_den / 60
-    second = sec_num / sec_den / 3600
 
+def ifdtag_to_decimal(tag):
+    '''Takes an exifread.classes.IfdTag, and converts the degrees-minutes-seconds GPS data to decimal
+    '''
+    degree = tag.values[0].num / tag.values[0].den
+    minute = tag.values[1].num / tag.values[1].den / 60
+    second = tag.values[2].num / tag.values[2].den / 3600
     return degree + minute + second
 
 
-def grab_gps(file_data):
-    """Grabs GPS metadata from EXIF header of a file
+def grab_gps(file_path):
+    '''Take a file path and return a dictionary of the GPS data as integers in a format as below:
+    {
+        'latitude' : I,
+        'longitude': J,
+        'altitude': K
+    }
 
-        Key: GPS GPSVersionID, value [2, 2, 0, 0]
-        Key: GPS GPSLatitudeRef, value N
-        Key: GPS GPSLatitude, value [48, 16, 579/100]
-        Key: GPS GPSLongitudeRef, value E
-        Key: GPS GPSLongitude, value [11, 36, 121/10]
-        Key: GPS GPSAltitudeRef, value 0
-        Key: GPS GPSAltitude, value 10801/20
-        Key: GPS GPSTimeStamp, value [17, 31, 16]
-        Key: GPS GPSDOP, value 10
-        Key: GPS GPSProcessingMethod, value [65, 83, 67, 73, 73, 0, 0, 0, 102, 117, 115, 101, 100]
-        Key: GPS GPSDate, value 2018:08:29
-        Key: Image GPSInfo, value 21009
-        Key: Image DateTime, value 2018:08:29 19:31:19 # When the file was changed?
+    Arguments:
+        file_path --- the file to process
 
-    Args:
-        file_data:
-        
     Return:
-        GPS tags as a dictionary of strings of ALTITUDE, DATETIME, LAT, LONG
-    """
-    header = exifread.process_file(file_data, details=False)
+        meta --- GPS data stripped from file and converted to decimal
+    '''
+    with open(file_path, "rb") as fd:
+        header = exifread.process_file(fd, details=False)
 
-    lat_dms = header["GPS GPSLatitude"].values
-    long_dms = header["GPS GPSLongitude"].values
+    meta = {}
+    lat_dms = header.get("GPS GPSLatitude")
+    long_dms = header.get("GPS GPSLongitude")
+    alt_tag = header.get("GPS GPSAltitude")
 
-    latitude = dms_to_decimal(  lat_dms[0].num, lat_dms[0].den,
-                                lat_dms[1].num, lat_dms[1].den,
-                                lat_dms[2].num, lat_dms[2].den)
-    longitude = dms_to_decimal( long_dms[0].num, long_dms[0].den,
-                                long_dms[1].num, long_dms[1].den,
-                                long_dms[2].num, long_dms[2].den)
+    if lat_dms and long_dms:
+        latitude = ifdtag_to_decimal(lat_dms)
+        longitude = ifdtag_to_decimal(long_dms)
+        if header['GPS GPSLatitudeRef'].printable  == 'S': 
+            latitude  *= -1
+        if header['GPS GPSLongitudeRef'].printable == 'W': 
+            longitude *= -1
+        meta["longitude"] = longitude
+        meta["latitude"] = latitude
 
-    if header['GPS GPSLatitudeRef'].printable  == 'S': 
-        latitude  *= -1
-    if header['GPS GPSLongitudeRef'].printable == 'W': 
-        longitude *= -1
+    if alt_tag:
+        alt_ratio = alt_tag.values[0]
+        altitude = alt_ratio.num / alt_ratio.den
+        if header['GPS GPSAltitudeRef'] == 1: 
+            altitude *= -1
+        meta["altitude"] = altitude
 
-    altitude = None
+    return meta
 
-    if 'GPS GPSAltitude' in header.keys():
-        alt = header['GPS GPSAltitude'].values[0]
-        altitude = alt.num/alt.den
-        if header['GPS GPSAltitudeRef'] == 1: altitude *= -1
+
+def lookup_address(geoloc, lat, long):
+    ''' Takes a geopy geolocator, a latitude and longitude as floats and looks up the associated address
+    '''
+    try:
+        location = geoloc.reverse("{}, {}".format(lat, long))
+        return location.address
+    except TypeError:
+        return "ADDRESS NOT FOUND"
+
+
+def format_plain(reports):
+    return "".join([r.__str__() for r in reports]) + "\n"
+
+
+def format_json(reports):
+    tmp = {i: vars(report) for i, report in enumerate(reports)}
+    return json.dumps(tmp)
+
+
+def format_kml(reports):
+    kml = simplekml.Kml(open=1)
+    for report in reports:
+        pnt = kml.newpoint()
+        pnt.name = report.digest
+        pnt.description = ", ".join([os.path.basename(p) for p in report.paths])
+        pnt.coords = [(report.longitude, report.latitude)]
+    return kml.kml()
+
+ 
+def main(path, format, address, recursive, output, verbose):
+    '''TODO:
+        - implement output
+        - 
+    '''
+    reports = []
+    geolocator = Nominatim(user_agent="pic2pin") if address else None
+    init = initialize_files(path, recursive=recursive)
+
+    for digest, paths in (tqdm(init.items()) if verbose else init.items()):
+        reports.append(FileReport(digest, paths, geoloc=geolocator))
+ 
+    # Switch for formatting
+    out_str = {
+        'plain' : format_plain,
+        'json' : format_json,
+        'kml' : format_kml
+    }[format[0]](reports)
+
+    if output:
+        with open(output, "w") as wp:
+            wp.write(out_str)
     else:
-        altitude = 0
-
-    return {"ALT":altitude, "LAT":latitude, "LONG":longitude}
+        print(out_str)
 
 
+if __name__=='__main__':
+    arguments = parse_arguments()
 
-def main():
-
-    exif_dict = {}
-
-    for file_name in sys.argv[1:]:
-        with open(file_name, "rb") as fp:
-            #photo_data = fp.read()
-            exif_dict[file_name] = grab_gps(fp)
-
-    for file, metadata in exif_dict.items():
-        print(file, end="\n")
-        print(metadata, end="\n\n")
-
-"""d
- TODO:
-    - Create KML file of points (with title as photo file name and date in metadata if available)
-    - Add extra info depending on metadata
-        - Accuracy of reading
-        - Altitude / Direction / Velocity
-        - Destination?
-        - Satelite used to calculate data
-"""
-
-
-
-if __name__=="__main__":
-    main()
+    main(**arguments)
