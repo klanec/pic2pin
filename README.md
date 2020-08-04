@@ -1,7 +1,7 @@
 # pic2pin
-OSINT script scraping GPS metadata from images in bulk.
+OSINT script for scraping GPS metadata from images in bulk.
 
-Supports KML, JSON and plaintext output
+Supports KML, JSON and plaintext output to either stdout or a file
 
 ## Usage:
 ```
