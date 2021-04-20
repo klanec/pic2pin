@@ -26,9 +26,10 @@ class FileReport(object):
         self.longitude=gps.get('longitude', None)
         self.altitude=gps.get('altitude', None)
         self.address = ""
+
         if geoloc is not None and self.latitude is not None:
             try:
-                self.address = geoloc.reverse("{}, {}".format(self.latitude, self.longitude)).address
+                self.address = geoloc.reverse(f"{self.latitude}, {self.longitude}").address
             except TypeError:
                 pass
     
@@ -62,6 +63,9 @@ def parse_arguments():
     # Optional
     parser.add_argument("-a", "--address", 
                     help="Lookup addresses as well (requires network)",
+                    action="store_true")
+    parser.add_argument("-i", "--ignore",
+                    help="Exclude images without location data from the report",
                     action="store_true")
     parser.add_argument("-r", "--recursive", 
                     help="Recurse into subdirectories",
@@ -205,7 +209,7 @@ def format_kml(reports):
     return kml.kml()
 
  
-def main(path, format, address, recursive, output, verbose):
+def main(path, format, address, ignore, recursive, output, verbose):
     '''TODO:
         - implement output
         - 
@@ -215,13 +219,18 @@ def main(path, format, address, recursive, output, verbose):
     init = initialize_files(path, recursive=recursive)
 
     for digest, paths in (tqdm(init.items()) if verbose else init.items()):
-        reports.append(FileReport(digest, paths, geoloc=geolocator))
+        file_report = FileReport(digest, paths, geoloc=geolocator)
+        if ignore and not file_report.latitude and not file_report.longitude and not file_report.altitude:
+            pass
+        else:
+            reports.append(file_report)
  
     # Switch for formatting
     out_str = {
         'plain' : format_plain,
         'json' : format_json,
         'kml' : format_kml
+        #'pdf' : format_pdf
     }[format[0]](reports)
 
     if output:
@@ -234,4 +243,5 @@ def main(path, format, address, recursive, output, verbose):
 if __name__=='__main__':
     arguments = parse_arguments()
 
+    #print(arguments)
     main(**arguments)
